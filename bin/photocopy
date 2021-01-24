@@ -1,0 +1,1426 @@
+#!/usr/bin/env perl
+#
+# Created:         Mo 2019-08-26 11:14:20 CEST
+# Last Modified:   Mi 2020-12-30 18:32:36 CET
+#
+# photocopy:
+#   Copy images to local image repository.
+
+use strict;
+use warnings;
+
+use version; our $VERSION = qw(0.1.0);
+
+# Include modules
+use Date::Parse;
+use File::stat;
+use File::Copy qw(copy move);
+use File::Basename;
+use File::Find;
+use File::HomeDir qw(my_home);
+use File::Path qw(make_path);
+use File::Slurp;
+use File::Spec::Functions qw(catdir catfile curdir abs2rel rel2abs);
+use FindBin;
+use Getopt::Long qw(:config bundling);
+use Image::Magick;
+use Module::Load::Conditional qw(check_install can_load);
+use Pod::Usage;
+use POSIX qw(strftime);
+use Regexp::Common qw(number);
+use Scalar::Util qw(blessed);
+
+
+# ------------------------------------------------
+#     F A L L B A C K    P R O G R E S S B A R
+# ------------------------------------------------
+
+#
+our $dryrun = 0;
+
+my $progress0 = can_load(
+    modules  => { 'Term::ProgressBar' => 2.22 },
+    autoload => 1,
+);
+
+if ($progress0)
+{
+    # Extend the Term::ProgressBar module
+    package Term::ProgressBar;
+
+    use Carp qw(croak);
+    use Scalar::Util qw(reftype);
+
+    # New constructor
+    sub new2
+    {
+        # Fetch arguments
+        my ($class, $params) = @_;
+
+        # Require hash
+        croak "Constructor 'new2' needs a hash reference"
+            unless reftype($params) eq 'HASH';
+
+        # Append dots to make width of label constant
+        while (exists $params->{name} and
+               length $params->{name} < 30) { $params->{name} .=  '.'; }
+
+        # Initialize defaults
+        $params->{count}  = -1 unless exists $params->{count};
+        $params->{remove} =  1 unless exists $params->{remove};
+
+        # Instantiate new progress bar with default constructor
+        my $self = Term::ProgressBar->new($params);
+
+        # Remove minor tics
+        $self->minor(0);
+
+        # Return progress bar instance
+        return $self;
+    }
+
+    # Wrapper around method `message' to add prefix (DRYRUN)
+    sub message2
+    {
+        my ($self, $text) = @_;
+        $text = '(DRYRUN) ' . $text if $main::dryrun;
+        $self->message($text);
+    }
+}
+else
+{
+    # Define fallback for Term::ProgressBar
+    package Term::ProgressBar::Fallback;
+
+    use Carp qw(croak);
+    use Scalar::Util qw(reftype);
+
+    # New constructor
+    sub new2
+    {
+        my ($class, $params) = @_;
+        my $self = {};
+        bless $self, $class;
+
+        # Check reference
+        croak "Constructor '$class' requires hash reference"
+            unless reftype($params) eq 'HASH';
+
+        # Check required parameters
+        for my $req (qw{name})
+        {
+            croak "Required parameter '$req' not passed to '$class' constructor"
+                unless exists $params->{$req};
+        }
+
+        # Check parameters
+        for my $attrib ( keys %{$params} )
+        {
+            croak "Invalid parameter '$attrib' passed to '$class' constructor"
+                unless $self->can($attrib);
+            $self->$attrib($params->{$attrib});
+        }
+
+        # Return reference
+        return $self;
+    }
+
+    # Dummy methods
+    sub name   { my ($self) = @_; }
+    sub count  { my ($self) = @_; }
+    sub remove { my ($self) = @_; }
+    sub update { my ($self) = @_; }
+    sub target { my ($self) = @_; }
+    sub minor  { my ($self) = @_; }
+
+    # Wrapper for message
+    sub message2
+    {
+        my ($self, $text) = @_;
+        $text = '(DRYRUN) ' . $text if $main::dryrun;
+        print $text . "\n";
+    }
+}
+
+
+# -----------------------------------
+#     M A I N   N A M E S P A C E
+# -----------------------------------
+
+package main;
+
+
+# Declare variables
+my ($srcdir,$outdir,$rcfile,$cachefile,$rcdir,$cvopt,@cache,@inbox,%opts);
+
+# Declare and initialize more variables
+my ($action,$limitmode,$outext) = qw( cp none JPG );
+my ($dirfmt1,$dirfmt2,$dirfmt3) = ( '%Y', '%m', '%d' );
+
+# Declare and initialize even more variables
+my ($dirdepth,$limitcount,$recurse,$progress) = ( 0, 0, 0, 0 );
+
+
+# Fetch command line options
+GetOptions(\%opts,
+    'srcdir=s',
+    'outdir=s',
+    'action=s',
+    'cvopt=s',
+    'dirdepth=i',
+    'dirfmt1=s',
+    'dirfmt2=s',
+    'dirfmt3=s',
+    'limitmode=s',
+    'limitcount=i',
+    'cachefile=s',
+    'outext=s',
+    'recurse!',
+    'progress!',
+    'dryrun!',
+    'man',
+    'help|?',
+);
+
+
+# Show plain old documentation
+pod2usage(1) if exists $opts{help};
+pod2usage(-exitval => 0, -verbose => 2) if exists $opts{man};
+
+
+# Select configuration directory
+$rcdir = catdir(curdir(), '.' . $FindBin::Script);
+$rcdir = catdir(my_home(), '.' . $FindBin::Script) unless -d $rcdir;
+
+
+# Make configuration directory unless exists
+make_path($rcdir) unless -d $rcdir;
+
+
+# Check number of arguments
+if (scalar @ARGV == 2)
+{
+    # Two arguments are interpreted as source and output directory
+    $srcdir = $ARGV[0];
+    $outdir = $ARGV[1];
+
+    # Handle ambiguous definition of SRCDIR
+    if (exists $opts{'srcdir'})
+    {
+        warn "Ambiguous definition of SRCDIR, option ignored";
+        delete $opts{'srcdir'};
+    }
+
+    # Handle ambiguous definition of OUTDIR
+    if (exists $opts{'outdir'})
+    {
+        warn "Ambiguous definition of OUTDIR, option ignored";
+        delete $opts{'outdir'};
+    }
+}
+elsif (scalar @ARGV == 1)
+{
+    # One argument is either OUTDIR or configuration file
+    if (-d $ARGV[0])
+    {
+        # Argument is a directory
+        $srcdir = '';
+        $outdir = $ARGV[0];
+    }
+    else
+    {
+        # Argument is a file
+        $rcfile = $ARGV[0];
+        unless (-f $rcfile)
+        {
+            # Lookup configuration file in configuration directory unless found
+            $rcfile = catfile($rcdir, $ARGV[0] . '.rc');
+
+            # Error message
+            die "Single argument needs to be either ".
+                "destination directory or existing configuration file\n"
+                    unless -f $rcfile;
+        }
+
+        # Load configuration file
+        open my $IN, '<', $rcfile or die "Cannot open '$rcfile': $!";
+
+        # Read linewise
+        while (defined (my $line = <$IN>))
+        {
+            # Remove trailing CR
+            chomp $line;
+
+            # Grep key and value
+            my ($key,$val) = split /=/, $line;
+
+            # Remove trailing spaces
+            $key =~ s/^\s+|\s+$//g;
+            $val =~ s/^\s+|\s+$//g;
+
+            # Key switch
+            if (lc($key) eq 'action')
+            {
+                # Grep operation mode
+                $action = ($val ne '') ? $val : undef;
+            }
+            elsif (lc($key) eq 'cvopt')
+            {
+                # Grep convert options
+                $cvopt = ($val ne '') ? $val : undef;
+            }
+            elsif (lc($key) eq 'dirdepth')
+            {
+                # Grep directory depth
+                $dirdepth = ($val ne '') ? $val : undef;
+            }
+            elsif (lc($key) eq 'dirfmt1')
+            {
+                # Grep directory format 1
+                $dirfmt1 = ($val ne '') ? $val : undef;
+            }
+            elsif (lc($key) eq 'dirfmt2')
+            {
+                # Grep directory format 2
+                $dirfmt2 = ($val ne '') ? $val : undef;
+            }
+            elsif (lc($key) eq 'dirfmt3')
+            {
+                # Grep directory format 3
+                $dirfmt3 = ($val ne '') ? $val : undef;
+            }
+            elsif (lc($key) eq 'limitmode')
+            {
+                # Grep limit mode
+                $limitmode = ($val ne '') ? $val : undef;
+            }
+            elsif (lc($key) eq 'limitcount')
+            {
+                # Grep limit counter
+                $limitcount = ($val ne '') ? $val : undef;
+            }
+            elsif (lc($key) eq 'cachefile')
+            {
+                # Grep cache file
+                $cachefile = ($val ne '') ? $val : undef;
+            }
+            elsif (lc($key) eq 'outext')
+            {
+                # Grep output format
+                $outext = ($val ne '') ? $val : undef;
+            }
+            elsif (lc($key) eq 'recurse')
+            {
+                # Grep source recursion flag
+                $recurse = ( lc($val) =~ /^false$/i ) ? 0 : 1;
+            }
+            elsif (lc($key) eq 'dryrun')
+            {
+                # Grep dryrun flag
+                $dryrun = ( lc($val) =~ /^false$/i ) ? 0 : 1;
+            }
+            elsif (lc($key) eq 'srcdir')
+            {
+                # Grep source directory
+                $srcdir = ($val ne '') ? $val : undef;
+            }
+            elsif (lc($key) eq 'progress')
+            {
+                # Grep progress flag
+                $progress = ( lc($val) =~ /^false$/i ) ? 0 : 1;
+            }
+            elsif (lc($key) eq 'outdir')
+            {
+                # Grep destination directory
+                $outdir = ($val ne '') ? $val : undef;
+            }
+            else
+            {
+                # Moan invalid key
+                warn "Key '$key' invalid in rcfile '$rcfile'";
+            }
+        }
+
+        # Close configuration file
+        close $IN or die "Cannot close $rcfile: $!";
+    }
+}
+else
+{
+    # Error message
+    die "Invalid syntax, either 1 or 2 arguments required\n";
+}
+
+# Process options from command line
+while (my ($key,$val) = each %opts)
+{
+    if    ($key eq 'action')     { $action     = $val; }
+    elsif ($key eq 'cvopt')      { $cvopt      = $val; }
+    elsif ($key eq 'dirdepth')   { $dirdepth   = $val; }
+    elsif ($key eq 'dirfmt1')    { $dirfmt1    = $val; }
+    elsif ($key eq 'dirfmt2')    { $dirfmt2    = $val; }
+    elsif ($key eq 'dirfmt3')    { $dirfmt3    = $val; }
+    elsif ($key eq 'limitmode')  { $limitmode  = $val; }
+    elsif ($key eq 'limitcount') { $limitcount = $val; }
+    elsif ($key eq 'cachefile')  { $cachefile  = $val; }
+    elsif ($key eq 'outext')     { $outext     = $val; }
+    elsif ($key eq 'recurse')    { $recurse    = $val; }
+    elsif ($key eq 'dryrun')     { $dryrun     = $val; }
+    elsif ($key eq 'progress')   { $progress   = $val; }
+    elsif ($key eq 'srcdir')     { $srcdir     = $val; }
+    elsif ($key eq 'outdir')     { $outdir     = $val; }
+}
+
+
+# ---------------------------------
+#     S P L A S H   S C R E E N
+# ---------------------------------
+
+
+# Show welcome message
+printf "\n".
+    "This is %s, a perl script to copy, move and convert image files\n".
+    "written %s\n\n",
+         uc($FindBin::Script),
+         strftime("%Y/%m/%d",localtime(stat($FindBin::Bin)->mtime));
+
+
+# -------------------------------------------
+#     P R O C E S S I N G   O P T I O N S
+# -------------------------------------------
+
+# Get current timestamp
+my $curtime = time;
+
+# Save configuration if filename given and configuration file does not exist
+if (defined $rcfile and not -f $rcfile)
+{
+    # Merge data to hash
+    my %confdata =
+    (
+        'action'     => $action,
+        'cvopt'      => $cvopt,
+        'dirdepth'   => $dirdepth,
+        'dirfmt1'    => $dirfmt1,
+        'dirfmt2'    => $dirfmt2,
+        'dirfmt3'    => $dirfmt3,
+        'limitcount' => $limitcount,
+        'limitmode'  => $limitmode,
+        'cachefile'  => $cachefile,
+        'outext'     => $outext,
+        'recurse'    => ( $recurse )  ? 'true' : 'false',
+        'dryrun'     => ( $dryrun )   ? 'true' : 'false',
+        'progress'   => ( $progress ) ? 'true' : 'false',
+        'srcdir'     => $srcdir,
+        'outdir'     => $outdir,
+    );
+
+    # Write configuration file
+    unless ($dryrun)
+    {
+        # Write hash to configuration file
+        open OUT, '>', $rcfile or die "Cannot create '$rcfile': $!";
+        while (my ( $key, $val ) = each %confdata)
+        {
+            printf OUT "%-10s = %s\n", $key, $val;
+        }
+        close OUT or die "Cannot close '$rcfile': $!";
+    }
+}
+
+
+# Use current working directory as source directory unless otherwise defined
+$srcdir = rel2abs(curdir()) if not defined $srcdir or $srcdir eq '';
+
+
+# Show configuration settings
+printf "Configuration file ... [%s]\n".
+       "Cache file ........... [%s]\n".
+       "Source directory ..... [%s]\n".
+       "Output directory ..... [%s]\n\n",
+           (defined $rcfile)    ? $rcfile    : 'undef',
+           (defined $cachefile) ? $cachefile : 'undef', $srcdir,
+           (defined $outdir)    ? $outdir    : 'undef';
+
+
+# Show options
+printf "Operation mode ........................ [%s]\n".
+       "Recurse into source subfolders ........ [%s]\n".
+       "Format of output files ................ [%s]\n".
+       "Number of subfolders at destination ... [%d]\n".
+       "Format of subfolder level 1 ........... [%s]\n".
+       "Format of subfolder level 2 ........... [%s]\n".
+       "Format of subfolder level 3 ........... [%s]\n".
+       "ImageMagick options ................... [%s]\n".
+       "Output directory threshold mode ....... [%s]\n".
+       "Output directory threshold number ..... [%s]\n".
+       "Dryrun ................................ [%s]\n" .
+       "Use module Term::ProgressBar .......... [%s]\n\n",
+           (defined $action)     ? $action : 'undef',
+           ($recurse)            ? 'true' : 'false',
+           (defined $outext)     ? $outext : 'undef',
+           $dirdepth,
+           (defined $dirfmt1)    ? $dirfmt1 : 'undef',
+           (defined $dirfmt2)    ? $dirfmt2 : 'undef',
+           (defined $dirfmt3)    ? $dirfmt3 : 'undef',
+           (defined $cvopt)      ? $cvopt : 'undef',
+           (defined $limitmode)  ? $limitmode : 'undef',
+           (defined $limitcount) ? $limitcount : 'undef',
+           ($dryrun)             ? 'true' : 'false',
+           ($progress)           ? 'enabled' : 'disabled';
+
+
+# ---------------------------------------------
+#     C O N F I G U R A T I O N   C H E C K
+# ---------------------------------------------
+
+# Check action tag
+die sprintf("Invalid action tag '%s'",$action)
+    if $action !~ /^(cp|mv|cv)$/i;
+
+# Check limitmode tag
+die sprintf("Invalid limitmode tag '%s'",$limitmode)
+    if defined $limitmode and $limitmode !~ /^(num|date|uptime|none)$/i;
+
+# Check cachefile setting
+die sprintf("Cachefile required for limitmode tag '%s'",$limitmode)
+    if not defined $cachefile and $limitmode =~ /^(num|date|uptime)$/i;
+
+# Check outputfile extension
+die sprintf("Invalid file extension '%s'",$outext)
+    if $outext !~ /^(gif|jpe?g|png|tiff?)$/i;
+
+# Check source directory
+die "Source directory not defined" unless defined $srcdir;
+die "Source directory '$srcdir' does not exist" unless -d $srcdir;
+
+# Check destination directory
+die "Output directory not defined" unless defined $outdir;
+die "Output directory '$outdir' does not exist" unless -d $outdir;
+die "Output directory '$outdir' is readonly" unless -w $outdir;
+
+# Check if source is subfolder of output directory or vice-versa
+die "Source directory is subfolder of output directory"
+    unless abs2rel($srcdir,$outdir) =~ /^\.\./;
+die "Output directory is subfolder of source directory"
+    unless abs2rel($outdir,$srcdir) =~ /^\.\./;
+
+# Set main progressbar class
+$progress = ($progress and $progress0) ? 'Term::ProgressBar' :
+                                         'Term::ProgressBar::Fallback';
+
+
+# -------------------------------------
+#     F I L E N A M E   C O D I N G
+# -------------------------------------
+
+
+# Coding characters
+my @cvnum2char = qw / A B C D E F G H K L M N Q R U W X Z /;
+
+
+# Encode integer number to fixed-width character string
+sub encode
+{
+    # Require integer arguments
+    die 'Invalid integer' unless $_[0] =~ $RE{num}{int};
+    die 'Invalid length'  unless $_[1] =~ $RE{num}{int};
+
+    # Require valid range
+    die 'Exceeding integer range'
+        if $_[0] < 1 or $_[0] > scalar @cvnum2char ** $_[1];
+
+    # Initialize variables
+    my $num = $_[0] - 1;
+    my $str = '';
+
+    # Perform encoding
+    do
+    {
+        $str = $cvnum2char[ $num % scalar @cvnum2char ] . $str;
+        $num = int( $num / scalar @cvnum2char );
+    }
+    while ( length($str) < $_[1] );
+
+    # Return result
+    return ( $str );
+}
+
+
+# Decode fixed-width character string to integer number
+sub decode
+{
+    # Initialize result
+    my $num = 1;
+
+    # Loop over input string
+    for (my $pow = 1; $pow <= length($_[0]); $pow++)
+    {
+        # Initialize slot
+        my $id = 0;
+
+        # Loop over digits
+        while ($cvnum2char[$id] ne uc(substr($_[0],-$pow,1)))
+        {
+            $id++;
+            die sprintf("'%s' contains invalid characters", $_[0])
+                if $id > $#cvnum2char;
+        }
+        $num += $id * scalar @cvnum2char ** ($pow - 1);
+    }
+
+    # Return result
+    return ( $num );
+}
+
+
+# Global reference on progress bar
+my $pb;
+
+
+# ---------------------------------------
+#      L O A D   C A C H E   F I L E
+# ---------------------------------------
+
+# Load file cache
+if (defined $cachefile and -f $cachefile)
+{
+    # Install new progress bar
+    $pb = $progress->new2({ name => 'Loading cachefile' });
+
+    # Reset cache
+    @cache = ();
+
+    # Slurp cache
+    my @input = read_file($cachefile)
+        or die "Cannot open cache '$cachefile': $!";
+
+    # Adjust progress bar
+    $pb->target($#input);
+
+    # Read linewise
+    for my $i (0 .. $#input)
+    {
+        # Fetch first line from stack
+        my $line = $input[$i];
+
+        # Update progress bar
+        $pb->update($i);
+
+        # Remove trailing CR
+        chomp $line;
+
+        # Skip comments
+        next if $line =~ /^#/;
+
+        # Split line to values
+        my @line = split /:/, $line;
+
+        # Remove trailing spaces
+        s/^\s+|\s+$//g foreach @line;
+
+        # Register values
+        my $this =
+        {
+            'datetime' => ( $line[0] ne '' ) ? $line[0] : undef,
+            'srcdate'  => ( $line[1] ne '' ) ? $line[1] : undef,
+            'outdate'  => ( $line[2] ne '' ) ? $line[2] : undef,
+            'srcfile'  => ( $line[3] ne '' ) ? $line[3] : undef,
+            'outfile'  => ( $line[4] ne '' ) ? $line[4] : undef,
+        };
+
+        # Check record integrity
+        my $flag = 1;
+
+        # (TODO) Place additional checks here
+
+        # Evaluate checks
+        if ($flag)
+        {
+            # Add record to cache
+            push @cache, $this;
+        }
+        else
+        {
+            # Warning message
+            $pb->message2(sprintf("Skipping invalid record (line %d)",$i));
+        }
+    }
+
+    # Forget progress bar
+    $pb = undef;
+}
+
+
+# -------------------------------------------------------
+#     P A R S I N G   S O U R C E   D I R E C T O R Y
+# -------------------------------------------------------
+
+
+# Install new progress bar
+$pb = $progress->new2({ name => 'Parsing source directory' });
+
+# Activate file count mode
+my $count = 0;
+my $countmode = 1;
+
+# Check search mode
+if ($recurse)
+{
+    # Count files first
+    find({ wanted   => sub { wanted($File::Find::name); },
+           no_chdir => 1,
+    }, $srcdir );
+
+    # Adjust progress bar
+    $pb->target($count);
+
+    # Reset counter and disable count mode
+    $count = 0;
+    $countmode = 0;
+
+    # Traverse file tree and fetch files
+    find({ wanted   => sub { wanted($File::Find::name); },
+           no_chdir => 1,
+    }, $srcdir );
+}
+else
+{
+    # Count files first
+    opendir(DIR,$srcdir) or die "Cannot open dir '$srcdir': $!";
+    while (my $file = readdir(DIR)) { wanted(catfile($srcdir,$file)); }
+    closedir(DIR) or die "Cannot close dir '$srcdir': $!";
+
+    # Adjust progress bar
+    $pb->target($count);
+
+    # Reset counter and disable count mode
+    $count = 0;
+    $countmode = 0;
+
+    # Parse files
+    opendir(DIR,$srcdir) or die "Cannot open dir '$srcdir': $!";
+    while (my $file = readdir(DIR)) { wanted(catfile($srcdir,$file)); }
+    closedir(DIR) or die "Cannot close dir '$srcdir': $!";
+}
+
+# Update progress bar
+$pb->update($count);
+
+# Forget progress bar
+$pb = undef;
+
+# Parse file
+sub wanted
+{
+    # Return unless argument is a valid file
+    my $file = shift;
+    return unless -f $file;
+
+    # Increment counter
+    $count++;
+
+    # Return if countmode is enabled
+    return if $countmode;
+
+    # Update progress bar
+    $pb->update($count);
+
+    # Collect file information
+    my $this =
+    {
+        'filename' => $file,
+        'mtime'    => stat($file)->mtime,
+        'filesize' => stat($file)->size,
+        'datetime' => undef,
+        'width'    => undef,
+        'length'   => undef,
+    };
+
+    # Check file location
+    my ($checkfile,$checksrc,$checkout) = ($file,1,1);
+    if (abs2rel($file,$outdir) !~ /^\.\./)
+    {
+        # File is contained in destination directory
+        $checksrc = 0;
+        $checkfile = abs2rel($file,$outdir);
+    }
+    elsif (abs2rel($file,$srcdir) !~ /^\.\./)
+    {
+        # File is contained in source directory
+        $checkout = 0;
+        $checkfile = abs2rel($file,$srcdir);
+    }
+
+    # Try to locate filename in cachefile
+    my $id = $#cache;
+    while ($id >= 0)
+    {
+        # Found in source directory
+        last if $checksrc and $cache[$id]{srcfile} eq $checkfile;
+
+        # Found in destination directory
+        last if $checkout and $cache[$id]{outfile} eq $checkfile;
+
+        # Decrement index
+        $id--;
+    }
+
+    # Skip if file is registered in cachefile and unchanged
+    return if $id >= 0 and $this->{mtime} <= $cache[$id]{srcdate};
+
+    # Invoke image object
+    my $image = new Image::Magick;
+
+    # Skip file if not an image
+    if ($image->Read($file))
+    {
+        # Issue warning message
+        $pb->message2(
+            sprintf("Ignoring '%s' (not an image)", abs2rel($file,$srcdir)));
+
+        # Proceed to next file
+        return;
+    }
+
+    # Skip file in case of invalid format
+    my $format = $image->Get('format');
+    $format =~ s/^Joint Photographic Experts Group JFIF format$/JPG/;
+    $format =~ s/^GIMP image$/XCF/;
+    $format =~ s/^Tagged Image File Format$/TIF/;
+    $this->{format} = $format;
+    if ($format !~ /^[a-z]+$/i)
+    {
+        # Issue warning message
+        $pb->message2(
+            sprintf("Ignoring '%s' (format not implemented)",
+                abs2rel($file,$srcdir)));
+
+        # Proceed to next file
+        return;
+    }
+
+    # Skip file in case of missing EXIF data
+    my $datetime = $image->Get('format','%[EXIF:DateTimeOriginal]');
+    $datetime = str2time($datetime);
+    $this->{datetime} = $datetime;
+    unless (defined $datetime)
+    {
+        # Issue warning message
+        $pb->message2(
+            sprintf("Ignoring '%s' (EXIF timestamp missing)",
+                abs2rel($file,$srcdir)));
+
+        # Proceed to next file
+        return;
+    }
+
+    # Get image dimensions
+    $this->{width}  = $image->Get('format','%[EXIF:ExifImageWidth]');
+    $this->{length} = $image->Get('format','%[EXIF:ExifImageLength]');
+
+    # Issue information message
+    $pb->message2(sprintf("Adding '%s'",abs2rel($file,$srcdir)));
+
+    # All checks passed
+    push @inbox, $this;
+}
+
+
+# -------------------------------------
+#     F I L E   P R O C E S S I N G
+# -------------------------------------
+
+# Process files if any
+if (@inbox)
+{
+    # Set name of progress bar
+    my $name = ( $action =~ m/^cp$/i ) ? 'Copying files' :
+               ( $action =~ m/^mv$/i ) ? 'Moving files' :
+               ( $action =~ m/^cv$/i ) ? 'Converting files' :
+                                         'Processing files' ;
+
+    # Install new progress bar
+    $pb = $progress->new2({ name => $name, count => scalar @inbox });
+
+    # Loop over all source files
+    for my $i (0 .. $#inbox)
+    {
+        # Receive source file and datetime
+        my $srcfile  = $inbox[$i]{filename};
+        my $format   = $inbox[$i]{format};
+        my $datetime = $inbox[$i]{datetime};
+
+        # Initialize destination directory
+        my $destdir = $outdir;
+
+        # Create subfolder level 1
+        $destdir =
+            catdir($destdir,strftime($dirfmt1,localtime($datetime)))
+                if $dirdepth >= 1;
+
+        # Proceed to subfolder level 2
+        $destdir =
+            catdir($destdir,strftime($dirfmt2,localtime($datetime)))
+                if $dirdepth >= 2;
+
+        # Proceed to subfolder level 3
+        $destdir = catdir($destdir,
+            strftime($dirfmt3,localtime($datetime))) 
+                if $dirdepth >= 3;
+
+        # Create output directory
+        make_path($destdir) unless -d $destdir;
+
+        # Determine output filename
+        my $outfile =
+            strftime( 'P%y', localtime($datetime) ) .
+            $cvnum2char[ (localtime($datetime))[4] ] .
+            strftime( '%d', localtime($datetime) ) .
+            encode( (localtime($datetime))[0] +
+                    (localtime($datetime))[1] * 60 +
+                    (localtime($datetime))[2] * 3600 , 4 ) . '.' . lc($outext);
+
+
+        #  Determine absolute filename
+        if (-f catfile($destdir,$outfile))
+        {
+            # Issue warning
+            $pb->message2(
+                sprintf("Skipping '%s' (destination file exists)", $outfile));
+        }
+        else
+        {
+            #
+            $outfile = catfile($destdir,$outfile);
+
+            # Process operation
+            if ($action =~ /^(?:cp)$/i and $format eq $outext)
+            {
+                # Issue information message
+                $pb->message2(
+                    sprintf("Copying '%s' (destination '%s')",
+                            abs2rel($srcfile,$srcdir),
+                            abs2rel($outfile,$outdir)));
+
+                # Copy file
+                copy($srcfile,$outfile)
+                    or die "Failed to copy '$srcfile' to '$outfile': $!"
+                        unless $dryrun;
+            }
+            elsif ($action =~ /^(?:mv)$/i and $format eq $outext)
+            {
+                # Issue information message
+                $pb->message2(
+                    sprintf("Moving '%s' (destination '%s')",
+                        abs2rel($srcfile,$srcdir),
+                        abs2rel($outfile,$outdir)));
+
+                # Move file
+                move($srcfile,$outfile)
+                    or die "Failed to move '$srcfile' to '$outfile': $!"
+                        unless $dryrun;
+            }
+            else
+            {
+                # Issue warning
+                $pb->message2(
+                    sprintf("Applying convert operation (format '%s' mismatch)",
+                            $format)) if $action =~ /^(?:cp|mv)$/i;
+
+                # Issue information message
+                $pb->message2(
+                    sprintf("Converting '%s' (destination '%s')",
+                        abs2rel($srcfile,$srcdir),
+                        abs2rel($outfile,$outdir)));
+
+                #
+                unless ($dryrun)
+                {
+                    # Read source file
+                    my $image = new Image::Magick;
+                    my $ec = $image->Read($srcfile);
+                    die "$ec" if "$ec";
+
+                    # Apply changes
+                    if (defined $cvopt)
+                    {
+                        # Process convert options
+                        my @args = split(/\s+/,$cvopt);
+                        while (@args)
+                        {
+                            # Fetch option
+                            my $opt = shift @args;
+                            $opt =~ tr/[A-Z]/[a-z]/;
+                            if ($opt eq '-crop')
+                            {
+                                # Apply crop operation
+                                my $val = shift @args;
+                                $ec = $image->Crop(geometry => $val);
+                                die "Failed to crop '$srcfile': $!" if "$ec";
+                            }
+                            elsif ($opt eq '-resize')
+                            {
+                                # Apply resize operation
+                                my $val = shift @args;
+                                $ec = $image->Resize($val);
+                                die "Failed to resize '$srcfile': $!" if "$ec";
+                            }
+                            elsif ($opt eq '-sharpen')
+                            {
+                                # Apply sharpn operation
+                                my $val = shift @args;
+                                $ec = $image->Sharpen($val);
+                                die "Failed to sharpen '$srcfile': $!" if "$ec";
+                            }
+                            else
+                            {
+                                # Issue warning
+                                $pb->message2(
+                                    sprintf("Operation '%s' not implemented",
+                                        $opt));
+                            }
+                        }
+                    }
+
+                    # Convert file
+                    $ec = $image->Write($outfile);
+                    die "Failed to write '$outfile': $!" if "$ec";
+                }
+            }
+
+            # Add image to cache
+            push @cache,
+            {
+                'datetime' => $datetime,
+                'srcdate'  => (-f $srcfile) ? stat($srcfile)->mtime() : time,
+                'outdate'  => (-f $outfile) ? stat($outfile)->mtime() : time,
+                'srcfile'  => abs2rel($srcfile,$srcdir),
+                'outfile'  => abs2rel($outfile,$outdir),
+            };
+        }
+
+        # Update progress bar
+        $pb->update($i+1);
+    }
+
+    # Forget progress bar
+    $pb = undef;
+}
+
+
+# -----------------------------------------------------
+#     R E M O V E   D E P R E C A T E D   F I L E S
+# -----------------------------------------------------
+
+# Remove deprecated files at output directory
+if ($limitmode !~ /^(?:none)$/i)
+{
+    # Sort files according to EXIF date or modification time
+    my $sortkey = ($limitmode =~ /^(?:date)$/i) ? 'datetime' : 'outdate';
+    @cache = sort { $a->{$sortkey} <=> $b->{$sortkey} } @cache;
+
+    # Flag files for removal if limitcount is NON-ZERO
+    if ($limitcount > 0)
+    {
+        # Install new progress bar
+        $pb = $progress->new2({
+                    name => 'Removing deprecated files',
+                    count => scalar @cache });
+
+        # Loop over files in cache
+        for my $id (0 .. $#cache)
+        {
+            # Update progress bar
+            $pb->update($id+1);
+
+            # Consider only existing files
+            my $outfile = catfile($outdir,$cache[$id]{outfile});
+
+            # Skip tests if file does not exist anymore
+            next unless -f $outfile;
+
+            # Initialize flag for file removal
+            my $threshold = 0;
+
+            # Process checks
+            if ($limitmode =~ /^(?:num)$/i)
+            {
+                # Remove oldest files in cache
+                $threshold = $id - ( scalar @cache - $limitcount );
+
+                # Check threshold
+                if ($threshold < 0)
+                {
+                    # Issue info message
+                    $pb->message2(
+                        sprintf("Removing '%s' (threshold exceeded) ... ",
+                            $outfile));
+                }
+                else
+                {
+                    # Issue info message
+                    $pb->message2(
+                        sprintf("Keeping '%s' (%d)",$outfile,$threshold+1));
+                }
+            }
+            elsif ($limitmode =~ /^(?:date)$/i)
+            {
+                # EXIF timestamp of current file is older than LIMITCOUNT days
+                $threshold = $limitcount * 86400 - ( $curtime - $cache[$id]{datetime} );
+
+                # Check threshold
+                if ($threshold < 0)
+                {
+                    # Issue info message
+                    $pb->message2(
+                        sprintf("Removing '%s' (threshold exceeded) ... ",
+                            $outfile));
+                }
+                else
+                {
+                    # Issue info message
+                    $pb->message2(
+                        sprintf("%sKeeping '%s' (%s) ... ",
+                            $outfile,timeleft($threshold)));
+                }
+            }
+            elsif ($limitmode =~ /^(?:uptime)$/i)
+            {
+                # Upload timestamp of current file is older than LIMITCOUNT days
+                $threshold = $limitcount * 86400 - ( $curtime - $cache[$id]{outdate} );
+
+                # Check threshold
+                if ($threshold < 0)
+                {
+                    # Issue info message
+                    $pb->message2(
+                        sprintf("Removing '%s' (threshold exceeded) ... ",
+                                $outfile));
+                }
+                else
+                {
+                    # Issue info message
+                    $pb->message2(
+                        sprintf("Keeping '%s' (%s) ... ",
+                                $outfile,timeleft($threshold)));
+                }
+            }
+
+            # Remove file
+            unlink $outfile
+                or warn "Failed to unlink '$outfile': $!"
+                    if $threshold < 0 and not $dryrun;
+        }
+
+        # Forget progress bar
+        $pb = undef;
+    }
+
+    # Initialize status message
+    $pb = $progress->new2({ name => 'Checking orphaned files' });
+
+    # Reset counter
+    $count = 0;
+    $countmode = 1;
+
+    # Count files in output directory
+    find( \&checkorphanfile, $outdir);
+
+    # Update progress bar
+    $pb->target($count);
+
+    # Reset counter
+    $count = 0;
+    $countmode = 0;
+
+    # Loop over files in output directory
+    find( \&checkorphanfile, $outdir);
+
+    # Remove empty subfolders
+    unless ($dryrun)
+    {
+        # finddepth( sub { rmdir($_) if -d }, $srcdir ) if $recurse;
+        finddepth( sub { rmdir($_) if -d }, $outdir ) if $dirdepth > 0;
+    }
+
+    # Forget progress bar
+    $pb = undef;
+}
+
+
+# Function to return time period using appropriate unit
+sub timeleft
+{
+    # Input time in seconds
+    my $count = shift;
+    my $unit = 'sec';
+
+    if ($count > 86400)
+    {
+        # Range of days
+        $count /= 86400;
+        $unit = 'day';
+    }
+    elsif ($count > 3600)
+    {
+        # Range of hours
+        $count /= 3600;
+        $unit = 'hour';
+    }
+    elsif ($count > 60)
+    {
+        # Range of minutes
+        $count /= 60;
+        $unit = 'min';
+    }
+
+    # Append plural-s to unit
+    $unit .= 's' if sprintf("%d",$count) ne '1';
+
+    # Return time string
+    sprintf("%d %s", $count, $unit);
+}
+
+# Check if file can be removed
+sub checkorphanfile
+{
+    # Skip unless regular file
+    return unless -f;
+
+    # Increment counter
+    $count++;
+
+    # Return if countmode is enabled
+    return if $countmode;
+
+    # Update progress bar
+    $pb->update($count);
+
+    # Skip unless file has the correct file extension
+    my (undef,undef,$suffix) = fileparse($_,'\.[^\.]*');
+    $suffix =~ s/^\.//;
+    return if lc($suffix) ne lc($outext);
+
+    # Skip if file is record in database
+    my $id = 0;
+    while ($id <= $#cache) { return if $cache[$id++]{outfile} eq $_; }
+
+    # Issue warning
+    $pb->message2(sprintf("Removing '%s' (orphaned file)",$_));
+
+    # Remove orphaned file
+    unlink $_
+        or warn "Failed to unlink [$_]: $!"
+            unless $dryrun;
+}
+
+
+# --------------------------------------
+#     S A V E   C A C H E   F I L E
+# --------------------------------------
+
+# Save cache
+if (defined $cachefile and not $dryrun)
+{
+    # Install new progress bar
+    $pb = $progress->new2({ name => 'Saving cachefile', count => scalar @cache });
+
+    # Create cache file
+    open my $OUT, '>', $cachefile or die "Cannot write cache [$cachefile]: $!";
+
+    # Print file header
+    printf $OUT "#\n".
+                "# PHOTOCOPY cache file\n".
+                "# created on %s\n".
+                "#\n".
+                "# DO NOT MODIFY THIS FILE\n".
+                "#\n".
+                "# datetime:srcdate:outdate:srcfile:outfile\n".
+                "#\n", strftime("%c",localtime($curtime));
+
+    # Loop over cache array
+    foreach my $id (0 .. $#cache)
+    {
+        # Update progress bar
+        $pb->update($id+1);
+
+        # Check source file in source directory
+        my $srcfile = catfile($srcdir,$cache[$id]{srcfile});
+        if (-f $srcfile and $cache[$id]{srcdate} == stat($srcfile)->mtime)
+        {
+            # Write record
+            printf $OUT "%d:%d:%d:%s:%s\n",
+                $cache[$id]{datetime},
+                $cache[$id]{srcdate},
+                $cache[$id]{outdate},
+                $cache[$id]{srcfile},
+                $cache[$id]{outfile};
+        }
+        else
+        {
+            # Print status message
+            $pb->message2(
+                sprintf("Skipping record '%s' (file missing)", $srcfile));
+        }
+    }
+
+    # Close cache file
+    close $OUT or die "Cannot close cache '$cachefile': $!";
+
+    # Forget progress bar
+    $pb = undef;
+}
+
+
+__END__
+
+
+=head1 NAME
+
+photocopy - Copy or move JPEG images from one location to another
+
+
+=head1 SYNOPSIS
+
+B<photocopy> [I<--options>]
+
+The script can be invoked using zero, one or two arguments.
+
+=over 4
+
+=item
+
+If it is invoked using B<two> arguments, the first argument holds the source directory F<srcdir> and the second argument holds the output directory F<outdir>.
+
+=item
+
+If it is invoked using B<one> argument and this argument is an existing B<directory>, it is assigned as output directory F<outdir>.  The current working directory is assumed to be the source directory F<srcdir>.
+
+=item
+
+If it is invoked using B<one> argument and this argument is an existing B<file>, it is used as configuration file containing options as key-value-pairs.  Additional command line options will override the settings in the configuration file.
+
+=item
+
+If it is invoked using B<one> argument and this argument is a B<string>, it is used as a basename for a configuration file with the file extension C<.rc>.  This file needs to reside in the directory F<~/.photocopy>.  Additional command line options will override the settings in the configuration file.
+
+=back
+
+
+=head1 REQUIRES
+
+Date::Parse, File::HomeDir, File::Slurp, Image::Magick, Regexp::Common
+
+
+=head1 DESCRIPTION
+
+The script B<photocopy> transfers JPEG images from the source directory F<srcdir> to the output directory F<outdir>.  Image files can be copied, moved or converted.
+
+The script can be used to transfer images from a photo camera to a local image repository or to upload the most recent images from a local image repository to a remote location.  For the latter, B<photocopy> can be configured to automatically remove images from the remote location that exceed a certain threshold.
+
+Files at the output location will be renamed to a unique filename based upon the EXIF original timestamp of the source file.
+
+
+=head1 WARNING
+
+It is strongly recommended to reserve the output directory F<outdir> exclusively for B<photocopy> and not to use it for any other purpose, especially when the option B<--limitmode> is enabled.  If the latter is true, unregistered files in F<outdir> matching the same file extension will be removed.  It is recommended to enable B<--dryrun> to see what would happen.
+
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<--srcdir>=I<string>
+
+Specifies the name of the source directory.  The source directory must exist and the user ust have read permission.
+
+=item B<--outdir>=I<string>
+
+Specifies the name of the output directory.  The output directory must exist and the user must have write permission.
+
+=item B<--action>=I<string>
+
+Specifies the transfer action.  Valid values are C<cp> for copying, C<mv> for moving and C<cv> for converting.
+
+=item B<--cachefile>=F<file>
+
+Specifies the name of the cachefile.
+
+=item B<--cvopt>=I<string>
+
+Adds ImageMagick options when B<action> is C<cv> for converting.
+
+=item B<--dirdepth>=I<number>
+
+Sets number of subfolders within directory I<outdir>.  Valid values are C<1>, C<2> or C<3>.
+
+=item B<--dirfmt1>=I<string>
+
+=item B<--dirfmt2>=I<string>
+
+=item B<--dirfmt3>=I<string>
+
+Use strftime flag to name subfolders in destination directory.  The default setting is C<%Y> for subfolder 1, C<%m> for subfolder 2 and C<%d> for subfolder 3.
+
+=item B<--limitmode>=I<string>
+
+Activates flag to limit files at remote repository.  Use C<none> (default) to disable this option.  If set, this option requires B<limitcount> being set to a positive value.  The following modes are available:
+
+=over 10
+
+=item C<num>
+
+Limits number of images at output directory to the most recent ones.
+
+=item C<date>
+
+Removes images when their EXIF datetime is older than a certain amount of days from today.
+
+=item C<uptime>
+
+Removes images after a certain amount of days being uploaded.
+
+=back
+
+=item B<--limitcount>=I<number>
+
+Adds threshold value for B<limitmode>.  The default is C<0>.
+
+=item B<--outext>=I<string>
+
+Specifies the format of the images at the output directory.  The default is C<JPG>.
+
+=item B<--recurse>
+
+Recurses into all subfolders of the source directory.
+
+=item B<--dryrun>
+
+Does not change the file system.  Only simulates what would be done.
+
+=item B<--progress>
+
+Enables or disables the use of a progress bar.  Default is enabled.
+
+=item B<--help>
+
+Prints a brief help message and exits.
+
+=back
+
+
+=head1 AUTHOR
+
+ Matthias Boljen (L<matthias.boljen@emi.fraunhofer.de>)
+
+
+=head1 COPYRIGHT AND LICENSE
+
+ Copyright 2020 by Matthias Boljen
+
+This program is free software; you can redistribute it and/or modify it under the same terms as Perl itself. See perldoc perlartistic.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+=cut
