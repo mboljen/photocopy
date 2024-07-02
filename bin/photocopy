@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 #
 # Created:         Mo 2019-08-26 11:14:20 CEST
-# Last Modified:   Mi 2020-12-30 18:32:36 CET
+# Last Modified:   Di 2024-07-02 19:34:34 CEST
 #
 # photocopy:
 #   Copy images to local image repository.
@@ -1308,10 +1308,6 @@ If it is invoked using B<one> argument and this argument is a B<string>, it is u
 =back
 
 
-=head1 REQUIRES
-
-Date::Parse, File::HomeDir, File::Slurp, Image::Magick, Regexp::Common
-
 
 =head1 DESCRIPTION
 
@@ -1321,10 +1317,8 @@ The script can be used to transfer images from a photo camera to a local image r
 
 Files at the output location will be renamed to a unique filename based upon the EXIF original timestamp of the source file.
 
+It is recommended to reserve the output directory F<outdir> exclusively for B<photocopy> and not to use it for any other purpose, especially when the option B<--limitmode> is enabled.  If the latter is true, unregistered files in F<outdir> matching the same file extension will be removed.  It is recommended to enable B<--dryrun> to see what would happen.
 
-=head1 WARNING
-
-It is strongly recommended to reserve the output directory F<outdir> exclusively for B<photocopy> and not to use it for any other purpose, especially when the option B<--limitmode> is enabled.  If the latter is true, unregistered files in F<outdir> matching the same file extension will be removed.  It is recommended to enable B<--dryrun> to see what would happen.
 
 
 =head1 OPTIONS
@@ -1410,7 +1404,14 @@ Prints a brief help message and exits.
 =back
 
 
-=head1 COPYRIGHT AND LICENSE
+
+=head1 REQUIRES
+
+Date::Parse, File::HomeDir, File::Slurp, Image::Magick, Regexp::Common
+
+
+
+=head1 COPYRIGHT
 
  Copyright (c) 2021 Matthias Boljen
 

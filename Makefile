@@ -14,8 +14,9 @@ SIG=$(PKG_DIR)/$(PKG_NAME).asc
 PREFIX?=/usr/local
 DOC_DIR=$(PREFIX)/share/doc/$(PKG_NAME)
 
-MAN_DIR=share/man/man1
-MAN=$(MAN_DIR)/$(NAME).1.gz
+MAN_SECTION ?= 1
+MAN_DIR = share/man/man$(MAN_SECTION)
+MAN = $(MAN_DIR)/$(NAME).$(MAN_SECTION).gz
 
 build: $(MAN) $(PKG)
 
@@ -31,7 +32,7 @@ man:
 	mkdir -p $(MAN_DIR)
 
 $(MAN): man
-	pod2man bin/$(NAME) | gzip -9 > $(MAN)
+	pod2man bin/$(NAME) | gzip -9 > $@
 
 sign: $(SIG)
 
@@ -39,9 +40,13 @@ $(SIG): $(PKG)
 	gpg --sign --detach-sign --armor $(PKG)
 
 clean:
-	rm -f $(MAN) $(PKG) $(SIG)
+	$(RM) $(MAN) $(PKG) $(SIG)
+
+veryclean: clean
+	$(RM) -r -d $(MAN_DIR)
 
 test:
+	$(info Target `$@` not implemented yet)
 
 tag:
 	git tag v$(VERSION)
@@ -60,4 +65,4 @@ uninstall:
 	rm -rf $(DOC_DIR)
 
 
-.PHONY: build sign man clean test tag release install uninstall all
+.PHONY: build sign man clean veryclean test tag release install uninstall all

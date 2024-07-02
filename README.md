@@ -3,19 +3,6 @@
 Copies or moves JPEG images from one location to another
 
 
-## Description
-
-The script `photocopy` transfers JPEG images from the source directory _srcdir_ to the output directory _outdir_.  Image files can be *copied*, *moved* or *converted*.
-
-The script can be used to transfer images from a photo camera to a local image repository or to upload the most recent images from a local image repository to a remote location.  For the latter, `photocopy` can be configured to automatically remove images from the remote location that exceed a certain threshold.
-
-Files at the output location will be renamed to a unique filename based upon the EXIF original timestamp of the source file.
-
-### Warning
-
-It is recommended to reserve the output directory _outdir_ exclusively for `photocopy` and not to use it for any other purpose, especially when the option **limitmode** is enabled.  If the latter is true, unregistered files in _outdir_ matching the same file extension will be removed.  It is recommended to enable **dryrun** to see what would happen.
-
-
 ## Synopsis
 
 ```console
@@ -33,76 +20,88 @@ The script can be invoked using zero, one or two arguments.
 + If it is invoked using *one* argument and this argument is a *string*, it is used as a basename for a configuration file with the file extension `.rc`.  This file needs to reside in the directory `~/.photocopy`.  Additional command line options will override the settings in the configuration file.
 
 
+## Description
+
+The script `photocopy` transfers JPEG images from the source directory _srcdir_ to the output directory _outdir_.  Image files can be *copied*, *moved* or *converted*.
+
+The script can be used to transfer images from a photo camera to a local image repository or to upload the most recent images from a local image repository to a remote location.  For the latter, `photocopy` can be configured to automatically remove images from the remote location that exceed a certain threshold.
+
+Files at the output location will be renamed to a unique filename based upon the EXIF original timestamp of the source file.
+
+### Warning
+
+It is recommended to reserve the output directory _outdir_ exclusively for `photocopy` and not to use it for any other purpose, especially when the option **limitmode** is enabled.  If the latter is true, unregistered files in _outdir_ matching the same file extension will be removed.  It is recommended to enable **dryrun** to see what would happen.
+
 
 ## Options
 
-+ **srcdir** = _folder_
++ `--srcdir` = _folder_
 
-    Specifies the name of the source directory.  The source directory must exist and the user must have read permission.
+  Specify the name of the source directory.  The source directory must exist and the user must have read permission.
 
-+ **outdir** = _folder_
++ `--outdir` = _folder_
 
-    Specifies the name of the output directory.  The output directory must exist and the user must have write permission.
+  Specify the name of the output directory.  The output directory must exist and the user must have write permission.
 
-+ **action** = _string_
++ `--action` = _string_
 
-    Specifies the transfer action.  Valid values are `cp` for copying, `mv` for moving and `cv` for converting.
+  Specify the transfer action.  Valid values are `cp` for copying, `mv` for moving and `cv` for converting.
 
-+ **cachefile** = _filename_
++ `--cachefile` = _filename_
 
-    Specifies the name of the cachefile.
+  Specify the name of the cachefile.
 
-+ **cvopt** = _string_
++ `--cvopt` = _string_
 
-    Adds ImageMagick options when **action** is `cv` for converting.
+  Add ImageMagick options when **action** is `cv` for converting.
 
-+ **dirdepth** = _integer_
++ `--dirdepth` = _integer_
 
-    Sets number of subfolders within directory _outdir_.  Valid values are `1`, `2` and `3`.
+  Set number of subfolders within directory _outdir_.  Valid values are `1`, `2` and `3`.
 
-+ **dirfmt1** | **dirfmt2** | **dirfmt3** = _string_
++ `--dirfmt1` | `--dirfmt2` | `--dirfmt3` = _string_
 
-    Use `strftime` flags to label subfolders in directory _outdir_.  The default setting is `%Y` for subfolder 1, `%m` for subfolder 2 and `%d` for subfolder 3.
+  Use `strftime` flags to label subfolders in directory _outdir_.  The default setting is `%Y` for subfolder 1, `%m` for subfolder 2 and `%d` for subfolder 3.
 
-+ **limitmode** = _string_
++ `--limitmode` = _string_
 
-    Activates flag to limit files at directory _outdir_.  Use `none` (default) to disable this option.  If set, this option requires **limitcount** being set to a positive value.  The following modes are available:
+  Activate flag to limit files at directory _outdir_.  Use `none` (default) to disable this option.  If set, this option requires **limitcount** being set to a positive value.  The following modes are available:
 
-    + `num`
+  - `num`
 
-        Limits the number of image files to the most recent ones.
+    Limit the number of image files to the most recent ones.
 
-    + `date`
+  - `date`
 
-        Removes images when their EXIF datetime is older than a certain amount of days from today.
+    Remove images when their EXIF datetime is older than a certain amount of days from today.
 
-    + `uptime`
+  - `uptime`
 
-        Removes images after a certain amount of days of being uploaded.
+    Remove images after a certain amount of days of being uploaded.
 
-+ **limitcount** = _integer_
++ `--limitcount` = _integer_
 
-    Adds threshold value for **limitmode**.  The default is `0`.
+  Add threshold value for **limitmode**.  The default is `0`.
 
-+ **outext** = _string_
++ `--outext` = _string_
 
-    Specifies the format of the images at the output directory.  The default is `JPG`.
+  Specify the format of the images at the output directory.  The default is `JPG`.
 
-+ **recurse**
++ `--recurse`
 
-    Recurses into all subfolders of the source directory.
+  Recurse into all subfolders of the source directory.
 
-+  **dryrun**
++ `--dryrun`
 
-    Does not change the file system.  Only simulates what would be done.
+  Do not change the file system.  Only simulate what would be done.
 
-+  **progress**
++ `--progress`
 
-    Enables or disables the use of a progress bar.  Default is enabled.
+  Enable or disable the use of a progress bar.  Default is enabled.
 
-+  **help**
++ `--help`
 
-    Prints a brief help message and exits.
+  Print a brief help message and exit.
 
 
 ## Requirements
